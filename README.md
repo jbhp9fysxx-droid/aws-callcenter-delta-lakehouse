@@ -1,45 +1,62 @@
-# aws-callcenter-delta-lakehouse
-End-to-end AWS Lakehouse analytics project using S3, Glue, Delta Lake, and Athena, implementing Bronze–Silver–Gold layers with data quality validation, UPSERTs, and analytics-ready Gold metrics for a call-center domain.
+# AWS Call Center Delta Lakehouse 
+End-to-end **AWS Lakehouse analytics project** for a call-center domain using  
+**Amazon S3, AWS Glue (Spark), Delta Lake, AWS Glue Data Catalog, and Amazon Athena**.
 
-# AWS Call Center Delta Lakehouse (S3 + Glue + Delta + Athena)
-
-End-to-end AWS Lakehouse analytics project for a call-center domain using **S3, AWS Glue (Spark), Delta Lake, AWS Glue Data Catalog, and Athena**.
-
-It implements **Bronze → Silver → Silver_Delta → Gold** layers with:
-- Data quality validation + rejected record handling
-- Delta **MERGE (UPSERT)** for late-arriving / reprocessed data
-- Analytics-ready **Gold** aggregates (daily summary, agent performance, duration metrics)
-- Querying through **Athena** using Glue Catalog tables
+The project implements a **Silver (Delta) → Gold** architecture with:
+- Strong **data quality validation**
+- **Delta MERGE (UPSERT)** handling late-arriving and reprocessed data
+- Analytics-ready **Gold** metrics
+- SQL access via **Athena**
 
 ---
 
 ## Architecture
 
-**S3 layout**
+### S3 Layout (Lakehouse Layers)
+
 - `s3://<bucket>/source/`  
-  Raw CSV drops (initial + updated files)
-- `s3://<bucket>/silver/`  
-  Validated Parquet (partitioned by year/month)
+  Raw CSV input files (initial load + reprocessed / late-arriving files)
+
 - `s3://<bucket>/exception/`  
-  Rejected rows with `Reject_reason` (append-only)
+  Rejected records with `Reject_reason`  
+  *(append-only for audit, reprocessing, and governance)*
+
 - `s3://<bucket>/silver_delta/`  
-  Delta table for validated UPSERTed Silver data (partitioned by year/month)
-- `s3://<bucket>/gold/gold_callcenter_analytics/`
-  - `gold_call_daily_summary/` (Delta)
-  - `gold_agent_performance/` (Delta)
-  - `gold_call_duration_metrics/` (Delta)
+  **Validated Silver layer (Delta Lake)**  
+  - Data quality rules applied  
+  - Late-arriving data handled via **MERGE (UPSERT)**  
+  - Business key: `call_id`  
+  - Partitioned by year/month
+
+- `s3://<bucket>/gold/gold_callcenter_analytics/`  
+  Analytics-ready **Delta tables**
+  - `gold_call_daily_summary/`
+  - `gold_agent_performance/`
+  - `gold_call_duration_metrics/`
+
 
 **Processing flow**
-1. Source CSV → DQ checks → valid → `silver/` (Parquet) + invalid → `exception/` (Parquet append)
-2. Source CSV (updated) → DQ checks → valid → **MERGE into** `silver_delta/` (Delta) + invalid → `exception/`
-3. `silver_delta/` → transformations → **MERGE into** Gold Delta tables
-4. Crawlers → Glue Catalog → Athena queries
+
+1. Source CSV files land in `s3://<bucket>/source/`
+
+2. AWS Glue Spark job applies data quality validations:
+   - Valid records → MERGE (UPSERT) into `silver_delta/` (Delta Lake)
+   - Invalid records → append into `exception/` with `Reject_reason`
+
+3. Gold analytics job reads from `silver_delta/` and produces Delta tables:
+   - `gold_call_daily_summary`
+   - `gold_agent_performance`
+   - `gold_call_duration_metrics`
+
+4. Glue Crawlers register Delta tables in the Glue Data Catalog
+
+5. Athena queries Gold Delta tables for analytics and reporting
 
 ---
 
 ## Data Model
 
-### Silver / Silver_Delta schema
+### Silver_Delta schema
 | column | type |
 |---|---|
 | call_id | int |
@@ -81,40 +98,44 @@ Metrics (seconds):
 
 ## Key Design Decisions
 
-### Why both `silver/` and `silver_delta/`?
-- `silver/` stores validated Parquet outputs (simple, cheap, easy to inspect)
-- `silver_delta/` is the **serving Silver** layer used for **UPSERT** and late-arriving data handling
-- Keeps validation + exception handling clean, while enabling reliable incremental updates with Delta MERGE
+### Why a single Silver Delta layer?
+- Data quality validation is applied **before** data enters Delta
+- Only valid records are written to `silver_delta`
+- Invalid records are routed to a separate `exception/` path for audit and reprocessing
+- Delta Lake enables **MERGE (UPSERT)** to safely handle:
+  - Late-arriving data
+  - Reprocessed files
+  - Idempotent job re-runs
+
+This avoids:
+- Duplicate records from append-only pipelines
+- Partition overwrite risks
+- Maintaining redundant Parquet Silver layers
 
 ### Why Delta MERGE?
-- Prevents duplicates if upstream re-sends the same records
-- Supports late-arriving corrections (update existing keys)
-- Enables repeatable pipelines without “append chaos”
+- Prevents duplicate records when upstream re-sends data
+- Updates existing business keys (`call_id`) safely
+- Supports repeatable pipelines without data loss
 
 ---
 
 ## How to Run (Glue Jobs)
 
-> These are AWS Glue Spark jobs. Configure IAM role with access to S3 + Glue + CloudWatch.
+> These are AWS Glue Spark jobs. Configure an IAM role with access to S3, Glue, Athena, and CloudWatch.
 
-### 1) Silver Validation Job
-- Reads: `source/call_center_raw.csv`
+### 1) Silver Delta Validation + UPSERT Job
+- Reads: `source/call_center_raw.csv` (and reprocessed CSVs)
+- Applies data quality rules
 - Writes:
-  - valid → `silver/` (Parquet, partitioned)
-  - invalid → `exception/` (Parquet append)
+  - Valid records → `silver_delta/` using Delta MERGE (UPSERT)
+  - Invalid records → `exception/` (Parquet, append-only)
 
-### 2) Silver Delta UPSERT Job
-- Reads: `source/call_center_raw_updated.csv`
-- Writes:
-  - valid → MERGE into `silver_delta/`
-  - invalid → append into `exception/`
-
-### 3) Gold Analytics Job
+### 2) Gold Analytics Job
 - Reads: `silver_delta/`
-- Writes (MERGE):
-  - `gold_call_daily_summary/`
-  - `gold_agent_performance/`
-  - `gold_call_duration_metrics/`
+- Produces analytics-ready Delta tables:
+  - `gold_call_daily_summary`
+  - `gold_agent_performance`
+  - `gold_call_duration_metrics`
 
 ---
 
@@ -135,7 +156,7 @@ LIMIT 10;
 ```
 ---
 
-### Data Quality Rules (Silver)
+### Data Quality Rules (Silver Delta)
 
 - `call_id`, `caller_id`, `agent_id` must be **non-null** and **numeric**
 - `call_start_time`, `call_end_time` must match the `HH:mm:ss` format
@@ -149,15 +170,11 @@ LIMIT 10;
 aws-callcenter-delta-lakehouse/
 │
 ├── glue_jobs/
-│   ├── 01_silver_validation.py
-│   ├── 02_silver_delta_upsert.py
-│   └── 03_gold_analytics.py
+│   ├── 01_silver_delta_upsert.py      # Validation + Delta MERGE (UPSERT)
+│   ├── 02_gold_analytics.py           # Gold aggregations (MERGE)
 │
 ├── sql/
-│   └── athena_queries.sql
-│
-├── docs/
-│   └── architecture.md   (optional)
+│   └── athena_queries.sq
 │
 └── README.md
 
