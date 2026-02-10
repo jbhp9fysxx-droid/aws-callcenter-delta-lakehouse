@@ -166,7 +166,7 @@ LIMIT 10;
 
 ---
 ### Repository Structure
-
+```text
 aws-callcenter-delta-lakehouse/
 │
 ├── glue_jobs/
@@ -174,10 +174,10 @@ aws-callcenter-delta-lakehouse/
 │   ├── 02_gold_analytics.py           # Gold aggregations (MERGE)
 │
 ├── sql/
-│   └── athena_queries.sq
+│   └── athena_queries.sq               # Analytics & Validation queries
 │
-└── README.md
-
+└── README.md                           # Project Documentation
+```
 ---
 
 ### Future Enhancements
